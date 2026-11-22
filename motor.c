@@ -242,6 +242,9 @@ uint16_t irq1_max = 0;
 
 
 uint16_t hall_pattern_error_counter = 0;
+volatile uint16_t ui16_hall_pattern_invalid_counter = 0;    // hall pattern 0 or 7 (reported in DIAG)
+volatile uint16_t ui16_hall_pattern_sequence_counter = 0;   // valid pattern but not the expected next one (reported in DIAG)
+volatile uint8_t ui8_hw_overcurrent_trips = 0;              // VADC hardware overcurrent irq count (reported in DIAG)
 // used to calculate hall angles based of linear regression of all ticks intervals
 // are filled in irq0 and transmitted in ebike_app.c using segger_rtt_print 
 #if ( GENERATE_DATA_FOR_REGRESSION_ANGLES == (1) )
@@ -312,6 +315,7 @@ inline uint32_t filtering_function(uint32_t ui32_temp_15b , uint32_t ui32_filter
 __RAM_FUNC void VADC0_G0_0_IRQHandler() {  // VADC compares the total current (12bits) with ADC_12_BIT_BATTERY_CURRENT_HW_LIMIT and generates an irq
     XMC_VADC_GROUP_ChannelClearEvent(VADC_I4_GROUP, VADC_I4_CHANNEL);
     ui8_hw_overcurrent_flag = 1; // sticky copy: ebike_control_motor() re-asserts the error if a main loop |= on ui8_m_system_state overwrote it
+    if (ui8_hw_overcurrent_trips < 255) ui8_hw_overcurrent_trips++;
     ui8_m_system_state |= ERROR_BATTERY_OVERCURRENT; // set the error to avoid that motor starts again
     // disable the motor
     ui8_motor_enabled = 0;
@@ -502,6 +506,11 @@ __RAM_FUNC void CCU80_0_IRQHandler(){ // called when ccu8 Slice 3 reaches 840  c
             ui8_hall_360_ref_valid = 0;  // reset the indicator saying no error for a 360° electric rotation 
             ui32_angle_per_tick_X16shift = 0; // 0 means unvalid value
             hall_pattern_error_counter++; // for debuging
+            if ((current_hall_pattern == 0) || (current_hall_pattern == 7)) {
+                ui16_hall_pattern_invalid_counter++;
+            } else {
+                ui16_hall_pattern_sequence_counter++;
+            }
     //        SEGGER_RTT_printf(0, "error %u\r\n", hall_pattern_error_counter);
 //            ui32_ref_angle = 0 ; // reset the position at pattern 1
             

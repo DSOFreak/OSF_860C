@@ -98,7 +98,9 @@ SOURCES=
 INCLUDES=
 
 # Add additional defines to the build process (without a leading -D).
-DEFINES=
+# OSF_GIT_HASH = first 4 bytes of the commit hash (reported to the master in the HELLO frame)
+OSF_GIT_HASH:=$(or $(shell git rev-parse HEAD 2>/dev/null | cut -c1-8),00000000)
+DEFINES=OSF_GIT_HASH=0x$(OSF_GIT_HASH)UL
 
 # Select softfp or hardfp floating point. Default is softfp.
 VFP_SELECT=
