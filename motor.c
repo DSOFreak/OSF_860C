@@ -76,6 +76,7 @@ volatile uint8_t ui8_controller_duty_cycle_ramp_up_inverse_step = PWM_DUTY_CYCLE
 volatile uint8_t ui8_controller_duty_cycle_ramp_down_inverse_step = PWM_DUTY_CYCLE_RAMP_DOWN_INVERSE_STEP_DEFAULT; // 73
 volatile uint16_t ui16_adc_voltage_cut_off = 300*100/BATTERY_VOLTAGE_PER_10_BIT_ADC_STEP_X1000; // 30Volt default value =  300*100/87 in TSDZ2
 volatile uint8_t ui8_adc_battery_current_filtered = 0; // current in adc10 bits units (average on 1 rotation)
+volatile uint8_t ui8_hw_overcurrent_flag = 0; // set (latched) by the VADC hardware overcurrent irq
 volatile uint32_t ui32_adc_battery_current_1_rotation_15b = 0; // value in 12 +2 +1 = 15 bits (ADC + IIR + average)
 volatile uint8_t ui8_controller_adc_battery_current_target = 0;
 volatile uint8_t ui8_g_duty_cycle = 0;
@@ -308,7 +309,9 @@ inline uint32_t filtering_function(uint32_t ui32_temp_15b , uint32_t ui32_filter
 
 
 
-void VADC0_G0_0_IRQHandler() {  // VADC is configured to compare the total current (12bits) with "1000" and generate an irq
+__RAM_FUNC void VADC0_G0_0_IRQHandler() {  // VADC compares the total current (12bits) with ADC_12_BIT_BATTERY_CURRENT_HW_LIMIT and generates an irq
+    XMC_VADC_GROUP_ChannelClearEvent(VADC_I4_GROUP, VADC_I4_CHANNEL);
+    ui8_hw_overcurrent_flag = 1; // sticky copy: ebike_control_motor() re-asserts the error if a main loop |= on ui8_m_system_state overwrote it
     ui8_m_system_state |= ERROR_BATTERY_OVERCURRENT; // set the error to avoid that motor starts again
     // disable the motor
     ui8_motor_enabled = 0;
@@ -637,14 +640,15 @@ __RAM_FUNC void CCU80_0_IRQHandler(){ // called when ccu8 Slice 3 reaches 840  c
     }
 
     // mstrens : moved from irq1 to irq0 to use average current over 1 rotation for regulation
-    #if (TYPE_OF_FILTER_FOR_CURRENT == (0))
-    if (ui32_adc_battery_current_15b_moving_average > (255 << 5)) { // clamp for safety
-        ui32_adc_battery_current_15b_moving_average = 255 << 5;
-    }    
-    ui8_adc_battery_current_filtered = ui32_adc_battery_current_15b_moving_average  >> 5;
-    #else
-    ui8_adc_battery_current_filtered  = ui32_adc_battery_current_1_rotation_15b >> 5 ; // from 15 bits to 10 bits like TSDZ2 
-    #endif
+    {
+        #if (TYPE_OF_FILTER_FOR_CURRENT == (0))
+        uint32_t ui32_temp_adc_current_10b = ui32_adc_battery_current_15b_moving_average  >> 5;
+        #else
+        uint32_t ui32_temp_adc_current_10b = ui32_adc_battery_current_1_rotation_15b >> 5 ; // from 15 bits to 10 bits like TSDZ2 
+        #endif
+        // saturate: 10-bit value must not wrap in the 8-bit variable (255 => above all limits)
+        ui8_adc_battery_current_filtered = (ui32_temp_adc_current_10b > 255U) ? 255U : (uint8_t) ui32_temp_adc_current_10b;
+    }
     /****************************************************************************/
     // - calculate interpolation angle and sine wave table index when speed is known
     ui8_interpolation_angle = 0; // interpolation angle
@@ -829,8 +833,8 @@ __RAM_FUNC void CCU80_1_IRQHandler(){ // called when ccu8 Slice 3 reaches 840  c
         //uint8_t ui8_temp_adc_current = ((XMC_VADC_GROUP_GetResult(vadc_0_group_0_HW , 15 ) & 0xFFFF) +
 	    //								(XMC_VADC_GROUP_GetResult(vadc_0_group_1_HW , 15 ) & 0xFFFF)) >>5  ;  // >>2 for IIR, >>2 for ADC12 to ADC10 , >>1 for averaging		
 	    // changed by mstrens to take care of infineon init for vadc (result 12bits and in reg 1)
-	    uint8_t ui8_temp_adc_current = (XMC_VADC_GROUP_GetResult(vadc_0_group_0_HW , VADC_I4_RESULT_REG ) & 0xFFFF) >> 2;// from 12 to 10bits 
-	    if ( ui8_temp_adc_current > ui8_adc_battery_overcurrent){ // 112+50 in tsdz2 (*0,16A) => 26A
+	    uint16_t ui16_temp_adc_current = (XMC_VADC_GROUP_GetResult(vadc_0_group_0_HW , VADC_I4_RESULT_REG ) & 0xFFFF) >> 2;// from 12 to 10bits 
+	    if ( ui16_temp_adc_current > (uint16_t) ui8_adc_battery_overcurrent){ // 112+50 in tsdz2 (*0,16A) => 26A
             ui8_g_duty_cycle -= (ui8_g_duty_cycle >> 2); // reduce immediately dutycycle by 25% to avoid overcurrent in next pwm 
         }    
 		
@@ -1103,7 +1107,7 @@ __RAM_FUNC void CCU80_1_IRQHandler(){ // called when ccu8 Slice 3 reaches 840  c
 }  // end of CCU8_1_IRQ
 
 
-void motor_enable_pwm(void) { //set posif with current position & restart the timers
+uint8_t motor_enable_pwm(void) { //set posif with current position & restart the timers; return 1 if PWM timers are running
     get_hall_pattern(); // refresh hall pattern in current_hall_pattern
     
     // one solution to activate is to generate an event that starts all timers in a synchronized way
@@ -1114,7 +1118,13 @@ void motor_enable_pwm(void) { //set posif with current position & restart the ti
     while ((!XMC_CCU8_SLICE_IsTimerRunning(PHASE_U_TIMER_HW)) && (retry_start_counter > 0)){ // to be sure it is running
         XMC_SCU_SetCcuTriggerHigh(SCU_GENERAL_CCUCON_GSC80_Msk);
         XMC_SCU_SetCcuTriggerLow(SCU_GENERAL_CCUCON_GSC80_Msk);
+        retry_start_counter--;
     }
+    if (!XMC_CCU8_SLICE_IsTimerRunning(PHASE_U_TIMER_HW)) {
+        motor_disable_pwm(); // timers did not start: keep all PWM slices stopped
+        return 0;
+    }
+    return 1;
 }
 
 void motor_disable_pwm(void) {

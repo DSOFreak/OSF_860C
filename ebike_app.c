@@ -75,6 +75,7 @@ static uint8_t ui8_battery_overcurrent_delay = 2;
 uint8_t ui8_adc_battery_overcurrent = (uint8_t)(ADC_10_BIT_BATTERY_CURRENT_MAX + ADC_10_BIT_BATTERY_EXTRACURRENT);
 static uint16_t ui16_adc_voltage_shutdown = 0;
 static uint8_t ui8_voltage_shutdown_flag = 0;
+uint8_t ui8_battery_overvoltage_flag = 0;
 
 // power control
 static uint8_t ui8_battery_current_max = DEFAULT_VALUE_BATTERY_CURRENT_MAX;
@@ -243,6 +244,7 @@ static void calc_cadence(void);
 static void ebike_control_lights(void);
 static void ebike_control_motor(void);
 static void check_system(void);
+static void check_battery_overvoltage(void);
 
 static void set_motor_ramp(void);
 static void apply_startup_boost(void);
@@ -483,6 +485,14 @@ static void ebike_control_motor(void) // is called every 25ms by ebike_app_contr
 		ui8_m_system_state |= ERROR_FATAL; // Undervoltage
 		ui8_voltage_shutdown_flag = 1;
 	}
+
+	// Check battery overvoltage (safety)
+	check_battery_overvoltage();
+
+	// re-assert the hardware overcurrent error (the irq bit could be lost by a concurrent |= on ui8_m_system_state)
+	if (ui8_hw_overcurrent_flag) {
+		ui8_m_system_state |= ERROR_BATTERY_OVERCURRENT;
+	}
 	
 	// Check battery Over-current (read current here in case PWM interrupt for some error was disabled)
 	//the resistance/gain in TSDZ8 is 4X smaller than in TSDZ2; still ADC is 12 bits instead of 10; so ADC 12bits TSDZ8 = ADC 10 bits TSDZ2
@@ -551,6 +561,7 @@ static void ebike_control_motor(void) // is called every 25ms by ebike_app_contr
 	  || (ui8_m_system_state & ERROR_BATTERY_OVERCURRENT)
 	  || (ui8_m_system_state & ERROR_THROTTLE)
 	  || (ui8_m_system_state & ERROR_FATAL)
+	  || (ui8_battery_overvoltage_flag)
 	  || (!ui8_motor_enabled)
 	  || (!ui8_assist_level_flag)
 	  || ((ui8_m_system_state)&&(!ui8_assist_with_error_enabled))) {
@@ -605,6 +616,7 @@ static void ebike_control_motor(void) // is called every 25ms by ebike_app_contr
 			|| (ui8_m_system_state & ERROR_BATTERY_OVERCURRENT)
 			|| (ui8_m_system_state & ERROR_THROTTLE)
 			|| (ui8_m_system_state & ERROR_FATAL)
+			|| (ui8_battery_overvoltage_flag)
 			|| ((ui16_motor_speed_erps == 0u)
 				&& (ui8_adc_battery_current_target == 0u)
 				&& (ui8_g_duty_cycle == 0u)))) {
@@ -613,6 +625,8 @@ static void ebike_control_motor(void) // is called every 25ms by ebike_app_contr
     }
 	else if (!ui8_motor_enabled
 			&& (!ui8_brake_state)
+			&& (!(ui8_m_system_state & (ERROR_MOTOR_BLOCKED | ERROR_BATTERY_OVERCURRENT | ERROR_THROTTLE | ERROR_FATAL))) // do not re-enable while a motor-stopping error is active
+			&& (!ui8_battery_overvoltage_flag)
 			&& (ui16_motor_speed_erps < ERPS_SPEED_OF_MOTOR_REENABLING) // enable the motor only if it rotates slowly or is stopped
 			&& (ui8_adc_battery_current_target > 0U)) {
 		ui8_motor_enabled = 1;
@@ -621,7 +635,9 @@ static void ebike_control_motor(void) // is called every 25ms by ebike_app_contr
 		//ui8_duty_cycle_ramp_up_inverse_step = PWM_DUTY_CYCLE_RAMP_UP_INVERSE_STEP_MIN;
 		//ui8_duty_cycle_ramp_down_inverse_step = PWM_DUTY_CYCLE_RAMP_DOWN_INVERSE_STEP_MIN;
 		ui8_fw_hall_counter_offset = 0;
-		motor_enable_pwm();
+		if (!motor_enable_pwm()) {
+			ui8_motor_enabled = 0; // PWM timers did not start; retry on a later cycle
+		}
 	}
 
 	/*  is not in 860C tsdz2 version ?????
@@ -634,6 +650,52 @@ static void ebike_control_motor(void) // is called every 25ms by ebike_app_contr
 			
 	mstest6=ui8_adc_battery_current_target;
 	*/
+}
+
+
+// E01 battery overvoltage: the 860C/H2 master sends no cell overvoltage config, so use the absolute
+// controller limit BATTERY_OVERVOLTAGE_MAX_X10. Reported as ERROR_FATAL in ui8_m_system_state (no free bit)
+// and in ui8_battery_overvoltage_flag; always stops the motor. Set after 2 sec above the limit,
+// cleared after 2 sec below the reset limit (ERROR_FATAL is cleared only if no other fatal error occurred).
+static void check_battery_overvoltage(void) // is called every 25ms by ebike_control_motor()
+{
+#define OVERVOLTAGE_COUNTER_THRESHOLD			80 // 80 * 25ms = 2 seconds
+	static uint8_t ui8_overvoltage_counter = 0;
+	static uint8_t ui8_fatal_set_by_overvoltage = 0;
+
+	if (!ui8_battery_overvoltage_flag) {
+		if (ui16_adc_battery_voltage_filtered > ADC_10_BIT_BATTERY_OVERVOLTAGE) {
+			if (++ui8_overvoltage_counter >= OVERVOLTAGE_COUNTER_THRESHOLD) {
+				ui8_overvoltage_counter = 0;
+				ui8_battery_overvoltage_flag = 1;
+				ui8_fatal_set_by_overvoltage = !(ui8_m_system_state & ERROR_FATAL);
+				ui8_m_system_state |= ERROR_FATAL;
+			}
+		}
+		else {
+			ui8_overvoltage_counter = 0;
+		}
+	}
+	else {
+		ui8_m_system_state |= ERROR_FATAL;
+		// undervoltage shutdown or comms loss also latch ERROR_FATAL: then it must stay set
+		if ((ui8_voltage_shutdown_flag) || (ui8_comm_error_counter > 30)) {
+			ui8_fatal_set_by_overvoltage = 0;
+		}
+		if (ui16_adc_battery_voltage_filtered < ADC_10_BIT_BATTERY_OVERVOLTAGE_RESET) {
+			if (++ui8_overvoltage_counter >= OVERVOLTAGE_COUNTER_THRESHOLD) {
+				ui8_overvoltage_counter = 0;
+				ui8_battery_overvoltage_flag = 0;
+				if (ui8_fatal_set_by_overvoltage) {
+					ui8_m_system_state &= ~ERROR_FATAL;
+				}
+				ui8_fatal_set_by_overvoltage = 0;
+			}
+		}
+		else {
+			ui8_overvoltage_counter = 0;
+		}
+	}
 }
 
 
