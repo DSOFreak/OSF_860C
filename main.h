@@ -281,6 +281,9 @@ HALL_COUNTER_OFFSET_UP:    29 -> 44
 // adc current (38 = 6A, 50 = 8A, 112 = 18A, 124 = 20A , 136 = 22A, 143 = 23A, 187 = 30A)
 #define ADC_10_BIT_BATTERY_EXTRACURRENT				50  //  8 amps
 #define ADC_10_BIT_BATTERY_CURRENT_MAX				143	// 23 amps // 1 = 0.16 Amp
+// hardware cut-off (VADC boundary on a single 12 bit sample, 1 = 0.04 Amp): (143 + 2*50) * 4 = 972 = 39 amps
+// margin above the software limit (max + extracurrent) to avoid false trips on PWM ripple
+#define ADC_12_BIT_BATTERY_CURRENT_HW_LIMIT			((ADC_10_BIT_BATTERY_CURRENT_MAX + (2 * ADC_10_BIT_BATTERY_EXTRACURRENT)) * 4)
 
 #define ADC_10_BIT_MOTOR_PHASE_CURRENT_MAX			187	// 30 amps // 1 = 0.16 Amp
 /*---------------------------------------------------------
@@ -336,6 +339,12 @@ HALL_COUNTER_OFFSET_UP:    29 -> 44
 
 // ADC battery voltage measurement
 #define BATTERY_VOLTAGE_PER_10_BIT_ADC_STEP_X1000		87  // conversion value verified with a cheap power meter = MVolt/adc10bit
+// battery overvoltage (E01): absolute limit of the TSDZ8 controller (36/48/52V packs; 14s full = 58.8V)
+// the 860C/H2 master sends no cell overvoltage config; reset 1V lower (hysteresis)
+#define BATTERY_OVERVOLTAGE_MAX_X10					600 // 60.0 V
+#define BATTERY_OVERVOLTAGE_RESET_X10				590 // 59.0 V
+#define ADC_10_BIT_BATTERY_OVERVOLTAGE				(uint16_t)((BATTERY_OVERVOLTAGE_MAX_X10 * 100UL) / BATTERY_VOLTAGE_PER_10_BIT_ADC_STEP_X1000) // 689
+#define ADC_10_BIT_BATTERY_OVERVOLTAGE_RESET		(uint16_t)((BATTERY_OVERVOLTAGE_RESET_X10 * 100UL) / BATTERY_VOLTAGE_PER_10_BIT_ADC_STEP_X1000) // 678
 
 
 // ADC battery voltage to be subtracted from the cut-off

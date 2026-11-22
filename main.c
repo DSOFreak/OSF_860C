@@ -297,12 +297,19 @@ int main(void)
     //XMC_WDT_Service();
     
 
-        // set interrupt when current exceed 256 (10 bits) = 1024 (12 bits) = boundaries set in modus
-    // link event on group 0 channel 1 to group specific interrupt
-    // mstrens : this part has not yet been updated for infineon init
-    //XMC_VADC_GROUP_ChannelSetEventInterruptNode(vadc_0_group_0_HW, 1, XMC_VADC_SR_GROUP_SR0 );
-    //NVIC_SetPriority(VADC0_G0_0_IRQn,0); // interrupt for group specific event G0 SR0
-    //NVIC_EnableIRQ(VADC0_G0_0_IRQn);    
+    // hardware overcurrent: irq when total current (G0 ch1, 12 bits) exceeds ADC_12_BIT_BATTERY_CURRENT_HW_LIMIT
+    // group 0 boundaries are not used by other channels (VADC_grp0_init sets them to 0)
+    XMC_VADC_GROUP_SetIndividualBoundary(VADC_I4_GROUP, XMC_VADC_CHANNEL_BOUNDARY_GROUP_BOUND0, 0U);
+    XMC_VADC_GROUP_SetIndividualBoundary(VADC_I4_GROUP, XMC_VADC_CHANNEL_BOUNDARY_GROUP_BOUND1, ADC_12_BIT_BATTERY_CURRENT_HW_LIMIT);
+    XMC_VADC_GROUP_ChannelSetBoundarySelection(VADC_I4_GROUP, VADC_I4_CHANNEL, XMC_VADC_BOUNDARY_SELECT_LOWER_BOUND, XMC_VADC_CHANNEL_BOUNDARY_GROUP_BOUND0);
+    XMC_VADC_GROUP_ChannelSetBoundarySelection(VADC_I4_GROUP, VADC_I4_CHANNEL, XMC_VADC_BOUNDARY_SELECT_UPPER_BOUND, XMC_VADC_CHANNEL_BOUNDARY_GROUP_BOUND1);
+    // link event on group 0 channel 1 to group specific interrupt G0 SR0
+    XMC_VADC_GROUP_ChannelSetEventInterruptNode(VADC_I4_GROUP, VADC_I4_CHANNEL, XMC_VADC_SR_GROUP_SR0);
+    XMC_VADC_GROUP_ChannelTriggerEventGenCriteria(VADC_I4_GROUP, VADC_I4_CHANNEL, XMC_VADC_CHANNEL_EVGEN_OUTBOUND);
+    XMC_VADC_GROUP_ChannelClearEvent(VADC_I4_GROUP, VADC_I4_CHANNEL);
+    NVIC_ClearPendingIRQ(VADC0_G0_0_IRQn);
+    NVIC_SetPriority(VADC0_G0_0_IRQn, 0U); // above CCU80 irq (priority 1)
+    NVIC_EnableIRQ(VADC0_G0_0_IRQn);
     
     // set interrupt 
 //    NVIC_SetPriority(CCU40_1_IRQn, 0U); //capture hall pattern and slice 2 time when a hall change occurs
@@ -336,6 +343,7 @@ int main(void)
     while ((!XMC_CCU8_SLICE_IsTimerRunning(PHASE_U_TIMER_HW)) && (retry_start_counter > 0)){ // to be sure it is running
         XMC_SCU_SetCcuTriggerHigh(SCU_GENERAL_CCUCON_GSC80_Msk);
         XMC_SCU_SetCcuTriggerLow(SCU_GENERAL_CCUCON_GSC80_Msk);
+        retry_start_counter--;
     
         //SEGGER_RTT_printf(0, "Retry CCU8 start; still %u try\r\n", retry_counter);
     }

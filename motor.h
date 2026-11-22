@@ -16,6 +16,7 @@ extern volatile uint8_t ui8_controller_duty_cycle_ramp_up_inverse_step;
 extern volatile uint8_t ui8_controller_duty_cycle_ramp_down_inverse_step;
 extern volatile uint16_t ui16_adc_voltage_cut_off;
 extern volatile uint8_t ui8_adc_battery_current_filtered;
+extern volatile uint8_t ui8_hw_overcurrent_flag;
 extern volatile uint8_t ui8_controller_adc_battery_current_target;
 extern volatile uint8_t ui8_g_duty_cycle;
 extern volatile uint8_t ui8_fw_hall_counter_offset;
@@ -77,7 +78,7 @@ uint32_t getHallPosition(void);
 void posif_init_position();
 void update_shadow_pattern(uint8_t current_pattern);
 
-void motor_enable_pwm(void) ;
+uint8_t motor_enable_pwm(void) ;
 void motor_disable_pwm(void) ;
 
 void get_hall_pattern();
