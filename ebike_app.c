@@ -37,6 +37,28 @@
 #define COMM_FRAME_TYPE_PERIODIC                      2
 #define COMM_FRAME_TYPE_CONFIGURATIONS                3
 #define COMM_FRAME_TYPE_FIRMWARE_VERSION              4
+#define COMM_FRAME_TYPE_HELLO                         5
+#define COMM_FRAME_TYPE_DIAG                          6
+#define COMM_FRAME_TYPE_CONFIG_READBACK               7
+
+// minimum frame length (len byte = bytes before the CRC) per received frame type
+#define COMM_FRAME_LEN_MIN                            3
+#define COMM_FRAME_LEN_MIN_PERIODIC                   12
+#define COMM_FRAME_LEN_MIN_CONFIGURATIONS             85
+#define COMM_FRAME_LEN_PERIODIC_SEQ                   14  // PERIODIC with sequence number in byte 12
+
+// STATUS value sent instead of the normal reply when a frame is rejected
+#define MOTOR_STATUS_FRAME_REJECTED                   0xFF
+
+// limits for received values
+#define CONFIG_FOC_ANGLE_MULTIPLIER_MIN               15
+#define CONFIG_FOC_ANGLE_MULTIPLIER_MAX               40
+#define WHEEL_SPEED_MAX_MIN                           2   // km/h, 0 = no limit
+#define WHEEL_SPEED_MAX_MAX                           99  // km/h
+
+// communication timeouts
+#define COMM_ERROR_COUNTER_FATAL                      30  // > 30 slots of 50 ms without valid frame -> PWM off, ERROR_FATAL
+#define SAFE_TIMEOUT_SOFT_STOP_TICKS                  12  // > 12 * 25 ms = 300 ms without valid PERIODIC -> current target 0
 
 // variables for various system functions
 uint8_t ui8_m_system_state = ERROR_NOT_INIT; // start with system error because configurations are empty at startup
@@ -52,7 +74,6 @@ static uint16_t ui16_wheel_perimeter = 2050 ;               	// 26'' wheel: 2050
 static uint8_t ui8_wheel_speed_max = 25;                  		// 25 Km/h
 uint8_t ui8_pedal_torque_per_10_bit_ADC_step_x100 = 67;
 static uint8_t ui8_target_battery_max_power_div25 = 20;    		// 500W (500/25 = 20)
-static uint8_t ui8_target_battery_max_power_div25_temp = 0;
 static uint8_t ui8_optional_ADC_function = 0;               	// 0 = no function
 
 // system
@@ -75,6 +96,10 @@ static uint8_t ui8_battery_overcurrent_delay = 2;
 uint8_t ui8_adc_battery_overcurrent = (uint8_t)(ADC_10_BIT_BATTERY_CURRENT_MAX + ADC_10_BIT_BATTERY_EXTRACURRENT);
 static uint16_t ui16_adc_voltage_shutdown = 0;
 static uint8_t ui8_voltage_shutdown_flag = 0;
+uint8_t ui8_battery_overvoltage_flag = 0; // owned by the overvoltage check (feat/safety-port), reported to the master
+uint8_t ui8_comms_fatal_flag = 0; // ERROR_FATAL caused by comms loss; cleared by a CONFIGURATIONS at standstill
+static uint8_t ui8_periodic_timeout_counter = 255; // 25 ms ticks since the last valid PERIODIC (soft stop)
+static uint8_t ui8_sw_overcurrent_trips = 0;
 
 // power control
 static uint8_t ui8_battery_current_max = DEFAULT_VALUE_BATTERY_CURRENT_MAX;
@@ -191,7 +216,9 @@ static uint8_t ui8_startup_assist_adc_battery_current_target = 0;
 
 // UART
 #define UART_NUMBER_DATA_BYTES_TO_RECEIVE   88
-#define UART_NUMBER_DATA_BYTES_TO_SEND      29
+#define UART_NUMBER_DATA_BYTES_TO_SEND      30
+#define UART_TX_FIFO_SIZE                   32
+#define UART_RX_INTERBYTE_TIMEOUT_TICKS     2500  // 10 ms in 4 us ticks: drop a partial frame after a gap
 
 volatile uint8_t ui8_received_package_flag = 0;
 volatile uint8_t ui8_rx_buffer[UART_NUMBER_DATA_BYTES_TO_RECEIVE];
@@ -209,9 +236,16 @@ static uint16_t ui16_crc_rx = 0;
 static uint16_t ui16_crc_tx = 0;
 //volatile uint8_t ui8_message_ID = 0;
 static uint8_t ui8_comm_error_counter = 0;
+static uint8_t ui8_comm_error_counter_peak = 0;
+static uint16_t ui16_rx_error_counter = 0;   // CRC, length and timeout errors
+static uint16_t ui16_rx_last_byte_ticks = 0;
+static uint16_t ui16_config_crc = 0;          // CRC of the last accepted CONFIGURATIONS frame
+extern volatile uint32_t system_ticks2;       // main.c: +1 every 65536 * 4 us
 
 static void communications_controller(void);
 static void communications_process_packages(uint8_t ui8_frame_type);
+static void communications_send_package(uint8_t ui8_len);
+static void update_battery_current_max(void);
 //static void uart_receive_package(void);
 //static void uart_send_package(void);
 // to debug
@@ -378,6 +412,11 @@ static void ebike_control_motor(void) // is called every 25ms by ebike_app_contr
     ui8_duty_cycle_ramp_down_inverse_step = PWM_DUTY_CYCLE_RAMP_DOWN_INVERSE_STEP_DEFAULT;
     ui8_adc_battery_current_target = 0;
     ui8_duty_cycle_target = 0;
+
+	// time since the last valid PERIODIC frame (SAFE_TIMEOUT soft stop)
+	if (ui8_periodic_timeout_counter < 255) {
+		ui8_periodic_timeout_counter++;
+	}
 	
 	// field weakening enable
 	if ((ui8_field_weakening_feature_enabled)
@@ -526,6 +565,9 @@ static void ebike_control_motor(void) // is called every 25ms by ebike_app_contr
 		}
 		if (ui8_error_battery_overcurrent_counter >= ui8_battery_overcurrent_delay) {
 			//ui8_m_system_state |= ui8_error_battery_overcurrent;
+			if ((!(ui8_m_system_state & ERROR_BATTERY_OVERCURRENT)) && (ui8_sw_overcurrent_trips < 255)) {
+				ui8_sw_overcurrent_trips++;
+			}
 			ui8_m_system_state |= ERROR_BATTERY_OVERCURRENT ; 
 		}
 	}
@@ -551,6 +593,7 @@ static void ebike_control_motor(void) // is called every 25ms by ebike_app_contr
 	  || (ui8_m_system_state & ERROR_BATTERY_OVERCURRENT)
 	  || (ui8_m_system_state & ERROR_THROTTLE)
 	  || (ui8_m_system_state & ERROR_FATAL)
+	  || (ui8_periodic_timeout_counter > SAFE_TIMEOUT_SOFT_STOP_TICKS)
 	  || (!ui8_motor_enabled)
 	  || (!ui8_assist_level_flag)
 	  || ((ui8_m_system_state)&&(!ui8_assist_with_error_enabled))) {
@@ -2342,34 +2385,52 @@ void ebike_control_lights(void)
 
 void fillRxBuffer(void)
 {
+	uint16_t ui16_now_ticks = XMC_CCU4_SLICE_GetTimerValue(HALL_SPEED_TIMER_HW);
+
+	// drop a partial frame after a gap in the byte stream (lost byte or corrupt length byte),
+	// so that the next frame is received normally (called every main loop, gap << 65536 ticks)
+	if ((ui8_state_machine != 0) && (ui8_received_package_flag == 0)
+	  && ((uint16_t)(ui16_now_ticks - ui16_rx_last_byte_ticks) > UART_RX_INTERBYTE_TIMEOUT_TICKS)) {
+		ui8_state_machine = 0;
+		ui8_rx_cnt = 0;
+		ui16_rx_error_counter++;
+	}
+
 	// when there is a byte received and we are not yet processing the frame
 	while ((XMC_USIC_CH_RXFIFO_IsEmpty(	CYBSP_DEBUG_UART_HW	) == false) && (ui8_received_package_flag == 0)){
 		// get the byte
 		uint8_t	ui8_byte_received = (uint8_t) XMC_USIC_CH_RXFIFO_GetData(CYBSP_DEBUG_UART_HW);
+		ui16_rx_last_byte_ticks = ui16_now_ticks;
  		switch (ui8_state_machine) {
 			case 0:
 				if (ui8_byte_received == 0x59) { // see if we get start package byte
 					ui8_rx_buffer[0] = ui8_byte_received;
+					ui8_rx_cnt = 0;
 					ui8_state_machine = 1;
-				}
-				else {
-					ui8_state_machine = 0;
 				}
 				break;
 
 			case 1:
-				if (ui8_byte_received > (UART_NUMBER_DATA_BYTES_TO_RECEIVE - 2)) {
-					ui8_state_machine = 0;
+				// len counts start, len and type bytes: 3 .. buffer size - 2 CRC bytes
+				if ((ui8_byte_received < COMM_FRAME_LEN_MIN)
+				  || (ui8_byte_received > (UART_NUMBER_DATA_BYTES_TO_RECEIVE - 2))) {
+					ui16_rx_error_counter++;
+					// a start byte here may be the start of the next frame
+					ui8_state_machine = (ui8_byte_received == 0x59) ? 1 : 0;
 				}
 				else {
 					ui8_rx_buffer[1] = ui8_byte_received;
 					ui8_rx_len = ui8_byte_received;
+					ui8_rx_cnt = 0;
 					ui8_state_machine = 2;
 				}
 				break;
 
 			case 2:
-				ui8_rx_buffer[ui8_rx_cnt + 2] = ui8_byte_received;
+				// len - 2 bytes (type + payload) + 2 CRC bytes follow the len byte; index max = len + 1 < buffer size
+				if ((ui8_rx_cnt + 2) < UART_NUMBER_DATA_BYTES_TO_RECEIVE) {
+					ui8_rx_buffer[ui8_rx_cnt + 2] = ui8_byte_received;
+				}
 				++ui8_rx_cnt;
 
 				if (ui8_rx_cnt >= ui8_rx_len) {
@@ -2380,14 +2441,23 @@ void fillRxBuffer(void)
 				break;
 
 			default:
+				ui8_state_machine = 0;
 				break;
 		}
 	}
 }
 
+static uint8_t communications_frame_len_min(uint8_t ui8_frame_type)
+{
+	switch (ui8_frame_type) {
+	  case COMM_FRAME_TYPE_PERIODIC:		return COMM_FRAME_LEN_MIN_PERIODIC;
+	  case COMM_FRAME_TYPE_CONFIGURATIONS:	return COMM_FRAME_LEN_MIN_CONFIGURATIONS;
+	  default:								return COMM_FRAME_LEN_MIN;
+	}
+}
+
 static void communications_controller(void)
 {
-	uint8_t ui8_frame_type_to_send = 0;
 	uint8_t ui8_len;
 
 	if (ui8_received_package_flag) {
@@ -2400,35 +2470,92 @@ static void communications_controller(void)
 
 		// if CRC is correct read the package
 		if (((((uint16_t) ui8_rx_buffer[ui8_len + 1]) << 8) +
-           ((uint16_t) ui8_rx_buffer[ui8_len])) == ui16_crc_rx) {
+           ((uint16_t) ui8_rx_buffer[ui8_len])) != ui16_crc_rx) {
+			ui16_rx_error_counter++;
+			if (ui8_comm_error_counter < 255) {
+				ui8_comm_error_counter++;
+			}
+		}
+		else if (ui8_len < communications_frame_len_min(ui8_rx_buffer[2])) {
+			// too short for its type: do not use stale bytes of an earlier frame
+			ui16_rx_error_counter++;
+			if (ui8_comm_error_counter < 255) {
+				ui8_comm_error_counter++;
+			}
+			ui8_tx_buffer[2] = COMM_FRAME_TYPE_STATUS;
+			ui8_tx_buffer[3] = MOTOR_STATUS_FRAME_REJECTED;
+			communications_send_package(4);
+		}
+		else {
+			// longest gap between valid frames, once the master has started
+			if ((ui8_m_motor_init_state != MOTOR_INIT_STATE_RESET)
+			  && (ui8_comm_error_counter > ui8_comm_error_counter_peak)) {
+				ui8_comm_error_counter_peak = ui8_comm_error_counter;
+			}
 			ui8_comm_error_counter = 0;
 
 			if (ui8_m_motor_init_state == MOTOR_INIT_STATE_RESET) {
 				ui8_m_motor_init_state = MOTOR_INIT_STATE_NO_INIT;
 			}
-			ui8_frame_type_to_send = ui8_rx_buffer[2];
-			communications_process_packages(ui8_frame_type_to_send);
+			communications_process_packages(ui8_rx_buffer[2]);
 		}
-		else {
-			ui8_received_package_flag = 0;
-			ui8_comm_error_counter++;
-		}
+		// get ready to get next package
+		ui8_received_package_flag = 0;
 	}
-	else {
+	else if (ui8_comm_error_counter < 255) {
 		ui8_comm_error_counter++;
 	}
 
 	// check for communications fail or display master fail
-	// can't fail more then 1000ms ??? 20 * 50ms
-	if (ui8_comm_error_counter > 30) {
+	// 31 slots * 50 ms = 1.55 s without valid frame
+	if (ui8_comm_error_counter > COMM_ERROR_COUNTER_FATAL) {
 		motor_disable_pwm();
 		ui8_motor_enabled = 0;
 		ui8_m_system_state |= ERROR_FATAL; // Comms failed
+		ui8_comms_fatal_flag = 1;
 	}
 
 	if (ui8_m_motor_init_state == MOTOR_INIT_STATE_RESET) {
 		communications_process_packages(COMM_FRAME_TYPE_ALIVE); 
 	}
+}
+
+
+// battery current limit (ADC steps) from the configured max current and the power limit at the actual voltage
+static void update_battery_current_max(void)
+{
+	uint16_t ui16_temp;
+
+	// 16 bit: no wrap above 40 A
+	uint16_t ui16_adc_battery_current_max_1 = ((uint16_t) ui8_battery_current_max * 100U)
+			/ BATTERY_CURRENT_PER_10_BIT_ADC_STEP_X100;
+
+	// from the power limit; no assist until the voltage is known
+	uint16_t ui16_adc_battery_current_max_2 = 0;
+	if (ui16_battery_voltage_filtered_x1000 > 0) {
+		uint32_t ui32_battery_current_max_x100 = ((uint32_t) ui8_target_battery_max_power_div25 * 2500000U)
+				/ ui16_battery_voltage_filtered_x1000;
+		uint32_t ui32_adc_battery_current_max_2 = ui32_battery_current_max_x100 / BATTERY_CURRENT_PER_10_BIT_ADC_STEP_X100;
+		ui16_adc_battery_current_max_2 = (ui32_adc_battery_current_max_2 > 0xFFFF) ? 0xFFFF : (uint16_t) ui32_adc_battery_current_max_2;
+	}
+
+	// set max battery current, limited to the hardware limit (so the overcurrent threshold can't wrap)
+	ui16_temp = (ui16_adc_battery_current_max_1 < ui16_adc_battery_current_max_2) ? ui16_adc_battery_current_max_1 : ui16_adc_battery_current_max_2;
+	if (ui16_temp > ADC_10_BIT_BATTERY_CURRENT_MAX) {
+		ui16_temp = ADC_10_BIT_BATTERY_CURRENT_MAX;
+	}
+	ui8_adc_battery_current_max = (uint8_t) ui16_temp;
+
+	// set max motor phase current
+	ui16_temp = (uint16_t)(ui8_adc_battery_current_max * ADC_10_BIT_MOTOR_PHASE_CURRENT_MAX) / ADC_10_BIT_BATTERY_CURRENT_MAX;
+	// limit max motor phase current if higher than configured hardware limit (safety)
+	if (ui16_temp > ADC_10_BIT_MOTOR_PHASE_CURRENT_MAX) {
+		ui16_temp = ADC_10_BIT_MOTOR_PHASE_CURRENT_MAX;
+	}
+	ui16_adc_motor_phase_current_max = ui16_temp;
+
+	// set limit battery overcurrent (max 143 + 50, no wrap)
+	ui8_adc_battery_overcurrent = ui8_adc_battery_current_max + ADC_10_BIT_BATTERY_EXTRACURRENT;
 }
 
 
@@ -2478,31 +2605,9 @@ static void communications_process_packages(uint8_t ui8_frame_type)
 		// battery max power target
 		ui8_target_battery_max_power_div25 = ui8_rx_buffer[6];
 		
-		// calculate max battery current in ADC steps
-		// from the received battery current limit & power limit
-		if (ui8_target_battery_max_power_div25 != ui8_target_battery_max_power_div25_temp) {
-			ui8_target_battery_max_power_div25_temp = ui8_target_battery_max_power_div25;
-			
-			uint8_t ui8_adc_battery_current_max_temp_1 = (uint16_t)(ui8_battery_current_max * (uint8_t)100)
-					/ (uint16_t)BATTERY_CURRENT_PER_10_BIT_ADC_STEP_X100;
-
-			// calculate max battery current in ADC steps from the received power limit
-			uint32_t ui32_battery_current_max_x100 = ((uint32_t) ui8_target_battery_max_power_div25 * 2500000)
-					/ ui16_battery_voltage_filtered_x1000;
-			uint8_t ui8_adc_battery_current_max_temp_2 = ui32_battery_current_max_x100 / BATTERY_CURRENT_PER_10_BIT_ADC_STEP_X100;
-
-			// set max battery current
-			ui8_adc_battery_current_max = ui8_min(ui8_adc_battery_current_max_temp_1, ui8_adc_battery_current_max_temp_2);
-			// set max motor phase current
-			ui16_temp = (uint16_t)(ui8_adc_battery_current_max * ADC_10_BIT_MOTOR_PHASE_CURRENT_MAX);
-			ui16_adc_motor_phase_current_max = (ui16_temp / ADC_10_BIT_BATTERY_CURRENT_MAX);
-			// limit max motor phase current if higher than configured hardware limit (safety)
-			if (ui16_adc_motor_phase_current_max > ADC_10_BIT_MOTOR_PHASE_CURRENT_MAX) {
-			ui16_adc_motor_phase_current_max = ADC_10_BIT_MOTOR_PHASE_CURRENT_MAX;
-			}
-			// set limit battery overcurrent
-			ui8_adc_battery_overcurrent = ui8_adc_battery_current_max + ADC_10_BIT_BATTERY_EXTRACURRENT;
-		}
+		// max battery current in ADC steps from the current limit and the power limit,
+		// recalculated on every frame so it follows the battery voltage
+		update_battery_current_max();
 		
 		// walk assist parameter
 		ui8_walk_assist_parameter = ui8_rx_buffer[7];
@@ -2519,14 +2624,27 @@ static void communications_process_packages(uint8_t ui8_frame_type)
 			}
 		}
 		else {
-			ui8_riding_mode = ui8_rx_buffer[8];
+			// only the assist modes 1..5 (and 8 if unlocked); walk and cruise only through the flags
+			ui8_temp = ui8_rx_buffer[8];
+			if (((ui8_temp >= POWER_ASSIST_MODE) && (ui8_temp <= HYBRID_ASSIST_MODE))
+			  || ((MOTOR_CALIBRATION_MODE_UNLOCKED) && (ui8_temp == MOTOR_CALIBRATION_MODE))) {
+				ui8_riding_mode = ui8_temp;
+			}
+			else {
+				ui8_riding_mode = OFF_MODE;
+			}
 		}
 		if (!ui8_walk_assist) {
 			// reset walk assist speed flag
 			ui8_walk_assist_speed_flag = 0;
 		}
-		// wheel max speed
-		ui8_wheel_speed_max = ui8_rx_buffer[9];
+		// wheel max speed, 0 = no limit; clamped so that (max - 2) and (max + 2) can't wrap
+		ui8_temp = ui8_rx_buffer[9];
+		if (ui8_temp > 0) {
+			if (ui8_temp < WHEEL_SPEED_MAX_MIN) { ui8_temp = WHEEL_SPEED_MAX_MIN; }
+			if (ui8_temp > WHEEL_SPEED_MAX_MAX) { ui8_temp = WHEEL_SPEED_MAX_MAX; }
+		}
+		ui8_wheel_speed_max = ui8_temp;
 
 		// optional ADC function, temperature sensor or throttle or not in use
 		ui8_optional_ADC_function = ui8_rx_buffer[10];
@@ -2555,7 +2673,7 @@ static void communications_process_packages(uint8_t ui8_frame_type)
 		ui8_tx_buffer[8] |= ((ui8_speed_limit_high_exceeded & 1) << 4);
 		ui8_tx_buffer[8] |= ((ui8_voltage_cut_off_flag & 1) << 5);
 		ui8_tx_buffer[8] |= ((ui8_voltage_shutdown_flag & 1) << 6);
-		// ui8_tx_buffer[8] |= ((available & 1) << 7);
+		ui8_tx_buffer[8] |= ((ui8_battery_overvoltage_flag & 1) << 7);
 
 		// throttle value from ADC
 		ui8_tx_buffer[9] = (uint8_t)(ui16_adc_throttle >> 2);
@@ -2614,10 +2732,38 @@ static void communications_process_packages(uint8_t ui8_frame_type)
 		ui8_tx_buffer[26] = ui8_adc_battery_current_filtered;
 	  
 		ui8_len += 24;
+
+		// SEQ: echo the sequence number of a len 14 request
+		if (ui8_rx_buffer[1] >= COMM_FRAME_LEN_PERIODIC_SEQ) {
+			ui8_tx_buffer[27] = ui8_rx_buffer[12];
+			ui8_len += 1;
+		}
+
+		// valid PERIODIC: end of the SAFE_TIMEOUT soft stop
+		ui8_periodic_timeout_counter = 0;
 		break;
 
 	  // set configurations
 	  case COMM_FRAME_TYPE_CONFIGURATIONS:
+		// reject a torque range of 0 (division) and a FOC multiplier out of range: keep the previous configuration
+		if (((ui8_rx_buffer[78] == 0) && (ui8_rx_buffer[79] == 0))
+		  || (ui8_rx_buffer[81] < CONFIG_FOC_ANGLE_MULTIPLIER_MIN)
+		  || (ui8_rx_buffer[81] > CONFIG_FOC_ANGLE_MULTIPLIER_MAX)) {
+			ui8_tx_buffer[2] = COMM_FRAME_TYPE_STATUS;
+			ui8_tx_buffer[3] = MOTOR_STATUS_FRAME_REJECTED;
+			ui8_len += 1;
+			break;
+		}
+		ui16_config_crc = ui16_crc_rx;
+
+		// SAFE_TIMEOUT recovery: frames are back, a new configuration arrived and the bike stands still
+		// (not while undervoltage or overvoltage hold ERROR_FATAL: a later CONFIGURATIONS retries)
+		if ((ui8_comms_fatal_flag) && (ui16_wheel_speed_x10 == 0)
+		  && (!ui8_voltage_shutdown_flag) && (!ui8_battery_overvoltage_flag)) {
+			ui8_comms_fatal_flag = 0;
+			ui8_m_system_state &= ~ERROR_FATAL;
+		}
+
 		// disable the motor to avoid a quick of the motor while configurations are changed
 		// disable the motor, lets hope this is safe to do here, in this way
 		// the motor shold be enabled again on the ebike_control_motor()
@@ -2631,10 +2777,16 @@ static void communications_process_packages(uint8_t ui8_frame_type)
 		ui16_battery_low_voltage_cut_off_x10 = (((uint16_t) ui8_rx_buffer[4]) << 8) + ((uint16_t) ui8_rx_buffer[3]);
 
 		// set low voltage cutoff (10 bit)
-		ui16_adc_voltage_cut_off = (ui16_battery_low_voltage_cut_off_x10 * 100U) / BATTERY_VOLTAGE_PER_10_BIT_ADC_STEP_X1000;
+		uint32_t ui32_adc_voltage_cut_off = ((uint32_t) ui16_battery_low_voltage_cut_off_x10 * 100U) / BATTERY_VOLTAGE_PER_10_BIT_ADC_STEP_X1000;
+		ui16_adc_voltage_cut_off = (ui32_adc_voltage_cut_off > 1023U) ? 1023U : (uint16_t) ui32_adc_voltage_cut_off;
 		
-		// set low voltage shutdown (10 bit)
-		ui16_adc_voltage_shutdown = ui16_adc_voltage_cut_off - DIFFERENCE_CUT_OFF_SHUTDOWN_10_BIT;
+		// set low voltage shutdown (10 bit), no wrap below 8.7 V
+		if (ui16_adc_voltage_cut_off > DIFFERENCE_CUT_OFF_SHUTDOWN_10_BIT) {
+			ui16_adc_voltage_shutdown = ui16_adc_voltage_cut_off - DIFFERENCE_CUT_OFF_SHUTDOWN_10_BIT;
+		}
+		else {
+			ui16_adc_voltage_shutdown = 0;
+		}
 		
 		// wheel perimeter
 		ui16_wheel_perimeter = (((uint16_t) ui8_rx_buffer[6]) << 8) + ((uint16_t) ui8_rx_buffer[5]);
@@ -2642,7 +2794,6 @@ static void communications_process_packages(uint8_t ui8_frame_type)
 		// battery max current
 		//ebike_app_set_battery_max_current(ui8_rx_buffer[7]);
 		ui8_battery_current_max = ui8_rx_buffer[7];
-		ui8_target_battery_max_power_div25_temp = 0;
 
 		ui8_temp = ui8_rx_buffer[8];
 		ui8_startup_boost_enabled = ui8_temp & 1;
@@ -2791,6 +2942,8 @@ static void communications_process_packages(uint8_t ui8_frame_type)
 		else {
 			ui8_assist_without_pedal_rotation_threshold = 0;
 		}
+
+		update_battery_current_max();
 		break;
 
       // firmware version
@@ -2811,10 +2964,104 @@ static void communications_process_packages(uint8_t ui8_frame_type)
 		ui8_len += 1;
 		break;
 
+      case COMM_FRAME_TYPE_HELLO:
+		// the master version and capabilities (bytes 3..5) are not used
+		ui8_tx_buffer[3] = OSF_PROTOCOL_VERSION;
+		ui8_tx_buffer[4] = (uint8_t) (MOTOR_CAPABILITIES & 0xff);
+		ui8_tx_buffer[5] = (uint8_t) (MOTOR_CAPABILITIES >> 8);
+		// git hash bytes in hash order (first hex digits first)
+		ui8_tx_buffer[6] = (uint8_t) ((uint32_t) OSF_GIT_HASH >> 24);
+		ui8_tx_buffer[7] = (uint8_t) ((uint32_t) OSF_GIT_HASH >> 16);
+		ui8_tx_buffer[8] = (uint8_t) ((uint32_t) OSF_GIT_HASH >> 8);
+		ui8_tx_buffer[9] = (uint8_t) ((uint32_t) OSF_GIT_HASH);
+		ui8_tx_buffer[10] = OSF_VERSION_MAJOR;
+		ui8_tx_buffer[11] = OSF_VERSION_MINOR;
+		ui8_tx_buffer[12] = ui8_reset_cause;
+		ui8_len += 10;
+		break;
+
+      case COMM_FRAME_TYPE_DIAG:
+		ui16_temp = ui16_hall_pattern_invalid_counter;
+		ui8_tx_buffer[3] = (uint8_t) (ui16_temp & 0xff);
+		ui8_tx_buffer[4] = (uint8_t) (ui16_temp >> 8);
+		ui16_temp = ui16_hall_pattern_sequence_counter;
+		ui8_tx_buffer[5] = (uint8_t) (ui16_temp & 0xff);
+		ui8_tx_buffer[6] = (uint8_t) (ui16_temp >> 8);
+		// MCU die temperature: ROM function returns Kelvin
+		{
+			int32_t i32_mcu_temperature = (int32_t) XMC_SCU_CalcTemperature() - 273;
+			if (i32_mcu_temperature > 127) { i32_mcu_temperature = 127; }
+			if (i32_mcu_temperature < -128) { i32_mcu_temperature = -128; }
+			ui8_tx_buffer[7] = (uint8_t) (int8_t) i32_mcu_temperature;
+		}
+		ui16_temp = ui16_adc_motor_phase_current;
+		ui8_tx_buffer[8] = (uint8_t) (ui16_temp & 0xff);
+		ui8_tx_buffer[9] = (uint8_t) (ui16_temp >> 8);
+		ui16_temp = (XMC_VADC_GROUP_GetResult(vadc_0_group_0_HW , VADC_I4_RESULT_REG ) & 0xFFFF) >> 2; // 12 to 10 bits
+		ui8_tx_buffer[10] = (uint8_t) (ui16_temp & 0xff);
+		ui8_tx_buffer[11] = (uint8_t) (ui16_temp >> 8);
+		ui16_temp = (ui32_battery_current_mA_avg > 0xFFFF) ? 0xFFFF : (uint16_t) ui32_battery_current_mA_avg;
+		ui8_tx_buffer[12] = (uint8_t) (ui16_temp & 0xff);
+		ui8_tx_buffer[13] = (uint8_t) (ui16_temp >> 8);
+		ui8_tx_buffer[14] = ui8_hw_overcurrent_trips;
+		ui8_tx_buffer[15] = ui8_sw_overcurrent_trips;
+		ui8_tx_buffer[16] = (uint8_t) (ui16_rx_error_counter & 0xff);
+		ui8_tx_buffer[17] = (uint8_t) (ui16_rx_error_counter >> 8);
+		ui8_tx_buffer[18] = ui8_comm_error_counter_peak;
+		ui8_tx_buffer[19] = ui8_g_duty_cycle;
+		ui8_tx_buffer[20] = hall_reference_angle;
+		// uptime in s: system_ticks2 counts 65536 * 4 us = 16384 / 62500 s (split to avoid a 32 bit overflow)
+		{
+			uint32_t ui32_ticks = system_ticks2;
+			uint32_t ui32_uptime_s = ((ui32_ticks / 62500U) * 16384U) + (((ui32_ticks % 62500U) * 16384U) / 62500U);
+			ui8_tx_buffer[21] = (uint8_t) (ui32_uptime_s & 0xff);
+			ui8_tx_buffer[22] = (uint8_t) ((ui32_uptime_s >> 8) & 0xff);
+			ui8_tx_buffer[23] = (uint8_t) ((ui32_uptime_s >> 16) & 0xff);
+			ui8_tx_buffer[24] = (uint8_t) ((ui32_uptime_s >> 24) & 0xff);
+		}
+		ui8_tx_buffer[25] = ui8_controller_adc_battery_current_target;
+		ui8_tx_buffer[26] = ui8_adc_battery_current_max;
+		// not in the proposed layout: bit 0 battery overvoltage, bit 1 comms fatal (recoverable), bit 2 SAFE_TIMEOUT soft stop active
+		ui8_tx_buffer[27] = (ui8_battery_overvoltage_flag & 1)
+				| ((ui8_comms_fatal_flag & 1) << 1)
+				| ((ui8_periodic_timeout_counter > SAFE_TIMEOUT_SOFT_STOP_TICKS) << 2);
+		ui8_len += 25;
+		break;
+
+      case COMM_FRAME_TYPE_CONFIG_READBACK:
+		ui8_tx_buffer[3] = (uint8_t) (ui16_config_crc & 0xff);
+		ui8_tx_buffer[4] = (uint8_t) (ui16_config_crc >> 8);
+		ui8_tx_buffer[5] = (uint8_t) (ui16_adc_voltage_cut_off & 0xff);
+		ui8_tx_buffer[6] = (uint8_t) (ui16_adc_voltage_cut_off >> 8);
+		ui8_tx_buffer[7] = (uint8_t) (ui16_wheel_perimeter & 0xff);
+		ui8_tx_buffer[8] = (uint8_t) (ui16_wheel_perimeter >> 8);
+		ui8_tx_buffer[9] = ui8_adc_battery_current_max;
+		ui8_tx_buffer[10] = (uint8_t) (ui16_adc_motor_phase_current_max & 0xff);
+		ui8_tx_buffer[11] = (uint8_t) (ui16_adc_motor_phase_current_max >> 8);
+		ui8_tx_buffer[12] = ui8_adc_battery_overcurrent;
+		ui8_tx_buffer[13] = ui8_foc_angle_multiplicator;
+		ui8_tx_buffer[14] = (uint8_t) (ui16_adc_pedal_torque_offset_set & 0xff);
+		ui8_tx_buffer[15] = (uint8_t) (ui16_adc_pedal_torque_offset_set >> 8);
+		ui8_tx_buffer[16] = (uint8_t) (ui16_adc_pedal_torque_range & 0xff);
+		ui8_tx_buffer[17] = (uint8_t) (ui16_adc_pedal_torque_range >> 8);
+		ui8_tx_buffer[18] = ui8_duty_cycle_ramp_up_inverse_step_default;
+		ui8_tx_buffer[19] = ui8_duty_cycle_ramp_down_inverse_step_default;
+		ui8_tx_buffer[20] = ui8_smooth_start_counter_set;
+		ui8_len += 18;
+		break;
+
       default:
 		break;
 	}
 
+	communications_send_package(ui8_len);
+}
+
+
+// add len and CRC to ui8_tx_buffer (start byte added here, type and payload already filled) and send it
+static void communications_send_package(uint8_t ui8_len)
+{
+	ui8_tx_buffer[0] = 0x43;
 	ui8_tx_buffer[1] = ui8_len;
 
 	// prepare crc of the package
@@ -2828,15 +3075,12 @@ static void communications_process_packages(uint8_t ui8_frame_type)
 	ui8_m_tx_buffer_index = 0;
 	// start transmition
 	// send the buffer on uart
-	if ((30 - XMC_USIC_CH_TXFIFO_GetLevel(CYBSP_DEBUG_UART_HW) ) >= (ui8_len + 2)){ // check if there is enough free space in Txfifo
+	if ((UART_TX_FIFO_SIZE - XMC_USIC_CH_TXFIFO_GetLevel(CYBSP_DEBUG_UART_HW) ) >= (ui8_len + 2)){ // check if there is enough free space in Txfifo
 		for(uint8_t i = 0; i < (ui8_len + 2); i++)  {
 			XMC_USIC_CH_TXFIFO_PutData(CYBSP_DEBUG_UART_HW, (uint16_t) ui8_tx_buffer[i]);
 			//XMC_UART_CH_Transmit(CYBSP_DEBUG_UART_HW , ui8_tx_buffer[i]);
 		}
 	}	 
-
-	// get ready to get next package
-	ui8_received_package_flag = 0;
 }
 
 

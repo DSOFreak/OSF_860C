@@ -61,6 +61,11 @@ extern uint8_t ui8_foc_angle_multiplicator;
 // added by mstrens because defined in ebike_app.c and used in motor.c
 extern uint8_t ui8_adc_battery_overcurrent;
 
+// diagnostic counters filled in motor.c irqs, reported in the DIAG frame
+extern volatile uint16_t ui16_hall_pattern_invalid_counter;
+extern volatile uint16_t ui16_hall_pattern_sequence_counter;
+extern volatile uint8_t ui8_hw_overcurrent_trips;
+
 // added by mstrens to debug
 
 #if ( GENERATE_DATA_FOR_REGRESSION_ANGLES == (1) )

@@ -49,6 +49,7 @@ extern uint8_t ui8_motor_enabled;
 
 
 extern uint8_t ui8_m_system_state;
+extern uint8_t ui8_comms_fatal_flag; // 1 = ERROR_FATAL was set by comms loss (cleared by SAFE_TIMEOUT recovery)
 
 // added by mstrens
 extern uint8_t ui8_m_motor_init_state ;

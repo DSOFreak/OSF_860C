@@ -51,6 +51,7 @@ uint16_t last_foc_pid_ticks = 0;    // used to call a function every 10 msec (up
 uint16_t last_foc_optimiser_ticks = 0 ; // used to call a function every 200 msec (update of optimizer at 5 hz)
 uint16_t last_system_ticks = 0;
 volatile uint32_t system_ticks2 = 0;
+uint8_t ui8_reset_cause = 0; // SCU reset status at boot (XMC_SCU_RESET_REASON_t bits), reported in HELLO
 
 
 // maximum duty cycle
@@ -175,6 +176,10 @@ int main(void)
 
 {
     cy_rslt_t result;
+
+    // keep the reset cause for the master, then clear it so the next reset reports only its own cause
+    ui8_reset_cause = (uint8_t) XMC_SCU_RESET_GetDeviceResetReason();
+    XMC_SCU_RESET_ClearDeviceResetReason();
 
     uint32_t wait_time = 1200000;
     while (wait_time > 0){  // wait a little at power on to let VCC be stable and so get probably better ADC conversions

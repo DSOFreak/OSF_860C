@@ -13,6 +13,29 @@
 #include "common.h"
                                     // !!!!!!!!!!!!!!
 #define FIRMWARE_VERSION "0.1.36"      //  !!! this version was derived from 0.1.13 for vlcd5 !!!!!!!!!!
+#define OSF_VERSION_MAJOR       1      // must follow FIRMWARE_VERSION; reported in the HELLO frame
+#define OSF_VERSION_MINOR       36
+
+// first 4 bytes of the git commit hash, passed by the Makefile (0 when unknown)
+#ifndef OSF_GIT_HASH
+#define OSF_GIT_HASH            0x00000000UL
+#endif
+
+// extended master protocol (HELLO frame, type 5): version and capability bits
+#define OSF_PROTOCOL_VERSION    1
+#define CAP_DIAG                (1u<<0)  // type 6 DIAG frame
+#define CAP_CONFIG_READBACK     (1u<<1)  // type 7 CONFIG_READBACK frame
+#define CAP_BAUD                (1u<<2)  // type 8 BAUD frame (not implemented)
+#define CAP_SAFE_TIMEOUT        (1u<<3)  // soft stop after 300 ms without PERIODIC, comms fatal recovery
+#define CAP_SEQ                 (1u<<4)  // sequence number in PERIODIC (request len 14, reply len 28)
+#define CAP_SPEED_CEIL          (1u<<5)  // speed limit is a hard ceiling (apply_speed_limit)
+#define CAP_THROTTLE_GUARD      (1u<<6)  // throttle input range checks (apply_throttle)
+#define MOTOR_CAPABILITIES      (CAP_DIAG | CAP_CONFIG_READBACK | CAP_SAFE_TIMEOUT | CAP_SEQ | CAP_SPEED_CEIL | CAP_THROTTLE_GUARD)
+
+// riding mode 8 (open loop duty cycle = riding mode parameter) is refused unless unlocked here
+#define MOTOR_CALIBRATION_MODE_UNLOCKED   (0)
+
+extern uint8_t ui8_reset_cause; // SCU RSTSTAT at boot (main.c)
 //#define MAIN_CONFIGURATOR_VERSION 2   // for configurator (must be the same as in xls sheet)
 //#define SUB_CONFIGURATOR_VERSION 1    // is not used (just for reference)
 
