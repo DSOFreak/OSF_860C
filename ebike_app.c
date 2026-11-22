@@ -1363,15 +1363,68 @@ static void apply_calibration_assist(void)
 
 
 
+// THROTTLE_GUARD: physical throttle (8 bit raw ADC) out of range = broken wire or short.
+// Any out of range sample: no throttle assist. THROTTLE_GUARD_SAMPLES consecutive samples (25 ms each):
+// ERROR_THROTTLE, cleared once the reading is back in range and the throttle is released.
+#define THROTTLE_GUARD_ADC_LOW				10U
+#define THROTTLE_GUARD_ADC_HIGH_MARGIN		20U
+#define THROTTLE_GUARD_SAMPLES				3U
+#define THROTTLE_RELEASED_MARGIN			5U
+
+// ui8_m_system_state is also set by the overcurrent ISR: clear atomically
+static void clear_throttle_error(void)
+{
+	if (ui8_m_system_state & ERROR_THROTTLE) {
+		uint32_t prim = __get_PRIMASK();
+		__disable_irq();
+		ui8_m_system_state &= ~ERROR_THROTTLE;
+		__set_PRIMASK(prim);
+	}
+}
+
 static void apply_throttle(void)
 {
+	static uint8_t ui8_throttle_out_of_range_counter;
+	uint8_t ui8_throttle_adc_valid = 0;
+	
 	//Next line has been moved from motor.c to here to save time in irq 1 ; >>2 because we use 10 bits instead of 12 bits
 	//ui16_adc_throttle = (XMC_VADC_GROUP_GetResult(vadc_0_group_1_HW , 5 ) & 0x0FFF) >> 2; // throttle gr1 ch7 result 5  in bg  p2.5
     // changed by mstrens to take care of infineon init
 	ui16_adc_throttle = (XMC_VADC_GROUP_GetResult(vadc_0_group_1_HW , VADC_POT_RESULT_REG ) & 0x0FFF) >> 2; // throttle gr1 ch7 result 7  in bg  p2.5
+	uint8_t ui8_throttle_adc_raw = (uint8_t)(ui16_adc_throttle >> 2);
+	
+	// throttle guard, only for a fitted and enabled physical throttle
+	if ((ui8_throttle_feature_enabled)&&(ui8_optional_ADC_function == THROTTLE_CONTROL)) {
+		if ((ui8_throttle_adc_raw < THROTTLE_GUARD_ADC_LOW)
+		  ||((uint16_t) ui8_throttle_adc_raw > ((uint16_t) ui8_throttle_max + THROTTLE_GUARD_ADC_HIGH_MARGIN))) {
+			if (ui8_throttle_out_of_range_counter < THROTTLE_GUARD_SAMPLES) {
+				ui8_throttle_out_of_range_counter++;
+			}
+			if (ui8_throttle_out_of_range_counter >= THROTTLE_GUARD_SAMPLES) {
+				ui8_m_system_state |= ERROR_THROTTLE;
+			}
+		}
+		else {
+			ui8_throttle_out_of_range_counter = 0;
+			
+			// in range: clear error (also from power-on check) only when throttle released
+			if ((uint16_t) ui8_throttle_adc_raw <= ((uint16_t) ui8_throttle_min + THROTTLE_RELEASED_MARGIN)) {
+				clear_throttle_error();
+			}
+			
+			// min >= max would map any reading above min to full throttle
+			if ((!(ui8_m_system_state & ERROR_THROTTLE))&&(ui8_throttle_min < ui8_throttle_max)) {
+				ui8_throttle_adc_valid = 1;
+			}
+		}
+	}
+	else {
+		ui8_throttle_out_of_range_counter = 0;
+	}
+	
     if (ui8_throttle_feature_enabled) {
 		// map adc value from 0 to 255
-		ui8_throttle_adc_in = map_ui8((uint8_t)(ui16_adc_throttle >> 2),
+		ui8_throttle_adc_in = map_ui8(ui8_throttle_adc_raw,
             ui8_throttle_min,
             ui8_throttle_max,
             (uint8_t) 0,
@@ -1381,7 +1434,7 @@ static void apply_throttle(void)
 		if (ui8_throttle_virtual) {
 			ui8_adc_throttle_assist = ui8_throttle_virtual;
 		}
-		else if ((ui8_optional_ADC_function == THROTTLE_CONTROL)&&(ui8_throttle_adc_in)) {
+		else if ((ui8_throttle_adc_valid)&&(ui8_throttle_adc_in)) {
 			ui8_adc_throttle_assist = ui8_throttle_adc_in;
 		}
 		else {
@@ -1390,6 +1443,11 @@ static void apply_throttle(void)
 		
 		// throttle with pedaling
 		if ((ui8_throttle_legal)&&(!ui8_pedal_cadence_RPM)) {
+			ui8_adc_throttle_assist = 0;
+		}
+		
+		// no throttle assist while braking (physical and virtual)
+		if (ui8_brake_state) {
 			ui8_adc_throttle_assist = 0;
 		}
 	
@@ -1465,27 +1523,42 @@ static void apply_temperature_limiting(void)
 }
 
 
+// SPEED_CEIL: the received wheel max speed is the real maximum assisted speed.
+// Current target fades linearly from (max - 4) km/h to 0 at max (fade start clamped at 0 km/h),
+// duty cycle target is 0 above max. All in uint16_t so no wrap for small or large max values.
+// max == 0 means no assist at all (fail safe; the master always sends 2..99 km/h).
+#define SPEED_LIMIT_FADE_KMH				4U
+
 static void apply_speed_limit(void)
 {
-    if (ui8_wheel_speed_max > 0U) {
-		uint16_t speed_limit_low  = (uint16_t)((uint8_t)(ui8_wheel_speed_max - 2U) * (uint8_t)10U); // casting literal to uint8_t ensures usage of MUL X,A
-		uint16_t speed_limit_high = (uint16_t)((uint8_t)(ui8_wheel_speed_max + 2U) * (uint8_t)10U);
-		
-		ui8_speed_limit_high_exceeded = 0;
-		if (ui16_wheel_speed_x10 > speed_limit_high) {
-			if (ui8_adc_battery_current_target > 0U) {
-				ui8_speed_limit_high_exceeded = 1;
-			}
-			ui8_duty_cycle_target = 0;
+	uint16_t speed_limit_high = (uint16_t) ui8_wheel_speed_max * 10U;
+	uint16_t speed_limit_low = 0U;
+	
+	if (ui8_wheel_speed_max > SPEED_LIMIT_FADE_KMH) {
+		speed_limit_low = (uint16_t)(ui8_wheel_speed_max - SPEED_LIMIT_FADE_KMH) * 10U;
+	}
+	
+	ui8_speed_limit_high_exceeded = 0;
+	if (ui16_wheel_speed_x10 > speed_limit_high) {
+		if (ui8_adc_battery_current_target > 0U) {
+			ui8_speed_limit_high_exceeded = 1;
 		}
-		
-        // set battery current target
-        ui8_adc_battery_current_target = (uint8_t) map_ui16(ui16_wheel_speed_x10,
-                speed_limit_low,
-                speed_limit_high,
-                ui8_adc_battery_current_target,
-                0U);
-    }
+		ui8_duty_cycle_target = 0;
+	}
+	
+	if (ui8_wheel_speed_max == 0U) {
+		// no valid limit received: no assist
+		ui8_adc_battery_current_target = 0;
+		ui8_duty_cycle_target = 0;
+	}
+	else {
+		// set battery current target
+		ui8_adc_battery_current_target = (uint8_t) map_ui16(ui16_wheel_speed_x10,
+				speed_limit_low,
+				speed_limit_high,
+				ui8_adc_battery_current_target,
+				0U);
+	}
 }
 
 
@@ -2193,18 +2266,23 @@ if (ui8_test_mode_flag == NORMAL_RUNNING_MODE) {  // check only in normal runnin
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 // E05 ERROR_THROTTLE
 #define THROTTLE_CHECK_COUNTER_THRESHOLD		 20 // 20 * 100ms = 2.0 seconds
-#define ADC_THROTTLE_MIN_VALUE_THRESHOLD		(uint8_t)(ADC_THROTTLE_MIN_VALUE + 5)
 
     static uint8_t ui8_throttle_check_counter;
 	
 	if ((ui8_throttle_feature_enabled)&&(ui8_optional_ADC_function == THROTTLE_CONTROL)) {
+		// power-on check: throttle must be released (compared with the configured min)
+		// the error is cleared in apply_throttle() once the throttle is released
 		if (ui8_throttle_check_counter < THROTTLE_CHECK_COUNTER_THRESHOLD) {
 			ui8_throttle_check_counter++;
 		
-			if ((ui16_adc_throttle >> 2) > ADC_THROTTLE_MIN_VALUE_THRESHOLD) {
+			if ((ui16_adc_throttle >> 2) > ((uint16_t) ui8_throttle_min + THROTTLE_RELEASED_MARGIN)) {
 				ui8_m_system_state |= ERROR_THROTTLE;
 			}
 		}
+	}
+	else {
+		// throttle disabled or not fitted: its input is ignored, so no throttle error
+		clear_throttle_error();
 	}
 }
 
